@@ -14,7 +14,7 @@ import androidx.core.app.NotificationCompat
 import com.vpnclient.app.MainActivity
 import com.vpnclient.app.core.ConfigBuilder
 import com.vpnclient.app.core.ParsedServer
-import io.nekohasekai.libbox.BoxService
+// BoxService removed
 import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.TunOptions
@@ -58,7 +58,7 @@ class CoreVpnService : VpnService(), PlatformInterface {
         }
     }
 
-    private var boxService: BoxService? = null
+    private var boxService: io.nekohasekai.libbox.BoxService? = null
     private var tunFd: android.os.ParcelFileDescriptor? = null
 
     override fun onCreate() {
@@ -91,7 +91,7 @@ class CoreVpnService : VpnService(), PlatformInterface {
         VpnStatus.update(VpnState.CONNECTING)
         startForeground(NOTIFICATION_ID, buildNotification("Подключение..."))
         try {
-            val service = Libbox.newService(configJson, this)
+            val service = Libbox.newBoxService(configJson, this)
             service.start()
             boxService = service
             VpnStatus.update(VpnState.CONNECTED)
