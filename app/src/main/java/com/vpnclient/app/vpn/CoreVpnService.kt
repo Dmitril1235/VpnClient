@@ -14,23 +14,14 @@ import androidx.core.app.NotificationCompat
 import com.vpnclient.app.MainActivity
 import com.vpnclient.app.core.ConfigBuilder
 import com.vpnclient.app.core.ParsedServer
-// BoxService removed
 import io.nekohasekai.libbox.Libbox
 import io.nekohasekai.libbox.PlatformInterface
 import io.nekohasekai.libbox.TunOptions
+import io.nekohasekai.libbox.InterfaceUpdateListener
+import io.nekohasekai.libbox.NeighborUpdateListener
+import io.nekohasekai.libbox.BridgeOptions
+import io.nekohasekai.libbox.BridgeSession
 
-/**
- * Реальный VPN-сервис: поднимает tun-интерфейс через android.net.VpnService
- * и передаёт его файловый дескриптор движку sing-box (libbox).
- *
- * ВАЖНО про PlatformInterface: это интерфейс, который generated-биндинг gomobile
- * ожидает от Kotlin-стороны (см. https://github.com/SagerNet/sing-box-for-android,
- * файл bg/PlatformInterfaceWrapper.kt + bg/VPNService.kt — код openTun() ниже
- * практически 1-в-1 оттуда). Набор методов может чуть отличаться между версиями
- * libbox — если Android Studio подсветит "class is not abstract and does not
- * implement member", жми Alt+Enter → "Implement members", он доставит недостающие
- * заглушки, а мы допишем их логику.
- */
 class CoreVpnService : VpnService(), PlatformInterface {
 
     companion object {
@@ -42,7 +33,6 @@ class CoreVpnService : VpnService(), PlatformInterface {
         const val ACTION_DISCONNECT = "com.vpnclient.app.DISCONNECT"
         const val EXTRA_CONFIG_JSON = "config_json"
 
-        /** Удобный способ запустить/остановить сервис из UI. */
         fun start(context: Context, server: ParsedServer) {
             val config = ConfigBuilder.build(server)
             val intent = Intent(context, CoreVpnService::class.java)
@@ -105,16 +95,9 @@ class CoreVpnService : VpnService(), PlatformInterface {
 
     private fun stopVpn() {
         VpnStatus.update(VpnState.STOPPING)
-        try {
-            boxService?.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "ошибка при остановке", e)
-        }
+        try { boxService?.close() } catch (e: Exception) { Log.e(TAG, "ошибка при остановке", e) }
         boxService = null
-        try {
-            tunFd?.close()
-        } catch (_: Exception) {
-        }
+        try { tunFd?.close() } catch (_: Exception) {}
         tunFd = null
         VpnStatus.update(VpnState.DISCONNECTED)
         stopForeground(true)
@@ -122,109 +105,62 @@ class CoreVpnService : VpnService(), PlatformInterface {
     }
 
     override fun onDestroy() {
-        try {
-            boxService?.close()
-        } catch (_: Exception) {
-        }
+        try { boxService?.close() } catch (_: Exception) {}
         boxService = null
         VpnStatus.update(VpnState.DISCONNECTED)
         super.onDestroy()
     }
 
-    override fun onRevoke() {
-        // Пользователь отозвал разрешение VPN в системных настройках.
-        stopVpn()
-    }
+    override fun onRevoke() { stopVpn() }
 
-    // ---------- PlatformInterface: сюда движок sing-box дёргает нас ----------
-
-    /** Открывает tun-интерфейс. Код ниже — адаптация openTun() из официального SFA. */
     override fun openTun(options: TunOptions): Int {
-        if (prepare(this) != null) error("android: нет разрешения на VPN (VpnService.prepare)")
-
-        val builder = Builder()
-            .setSession("VpnClient")
-            .setMtu(options.mtu)
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            builder.setMetered(false)
-        }
-
-        val inet4Address = options.inet4Address
-        while (inet4Address.hasNext()) {
-            val address = inet4Address.next()
-            builder.addAddress(address.address(), address.prefix())
-        }
-        val inet6Address = options.inet6Address
-        while (inet6Address.hasNext()) {
-            val address = inet6Address.next()
-            builder.addAddress(address.address(), address.prefix())
-        }
-
+        if (prepare(this) != null) error("нет разрешения VPN")
+        val builder = Builder().setSession("VpnClient").setMtu(options.mtu)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) builder.setMetered(false)
+        val inet4 = options.inet4Address
+        while (inet4.hasNext()) { val a = inet4.next(); builder.addAddress(a.address(), a.prefix()) }
+        val inet6 = options.inet6Address
+        while (inet6.hasNext()) { val a = inet6.next(); builder.addAddress(a.address(), a.prefix()) }
         if (options.autoRoute) {
             builder.addDnsServer(options.dnsServerAddress)
             builder.addRoute("0.0.0.0", 0)
             builder.addRoute("::", 0)
-            // Само приложение не должно попадать в свой же туннель.
-            try {
-                builder.addDisallowedApplication(packageName)
-            } catch (_: Exception) {
-            }
+            try { builder.addDisallowedApplication(packageName) } catch (_: Exception) {}
         }
-
-        val pfd = builder.establish()
-            ?: error("android: не удалось поднять VPN-интерфейс (приложение не подготовлено / отозвано)")
+        val pfd = builder.establish() ?: error("не удалось поднять VPN-интерфейс")
         tunFd = pfd
         return pfd.fd
     }
 
-    override fun writeLog(message: String) {
-        Log.d(TAG, message)
-    }
-
-    override fun useProcFS(): Boolean = true
-
+    override fun autoDetectInterfaceControl(fd: Int) { protect(fd) }
     override fun usePlatformAutoDetectInterfaceControl(): Boolean = true
-
-    override fun autoDetectInterfaceControl(fd: Int) {
-        protect(fd)
-    }
-
-    override fun usePlatformDefaultInterfaceMonitor(): Boolean = false
-
+    override fun useProcFS(): Boolean = true
     override fun underNetworkExtension(): Boolean = false
-
-    override fun includeAllNetworks(): Boolean = false
-
-    override fun clearDNSCache() {
-        // На Android нет прямого системного API для этого — no-op.
-    }
-
-    // ---------- Уведомление foreground-сервиса ----------
+    override fun usePlatformShell(): Boolean = false
+    override fun usePlatformBridge(): Boolean = false
+    override fun tailscaleHostname(): String = ""
+    override fun clearDNSCache() {}
+    override fun checkPlatformShell() {}
+    override fun createBridge(options: BridgeOptions): BridgeSession = throw UnsupportedOperationException()
+    override fun findConnectionOwner(ipProtocol: Int, sourceAddress: String): Int = -1
+    override fun startDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {}
+    override fun closeDefaultInterfaceMonitor(listener: InterfaceUpdateListener) {}
+    override fun startNeighborMonitor(listener: NeighborUpdateListener) {}
+    override fun closeNeighborMonitor(listener: NeighborUpdateListener) {}
 
     private fun buildNotification(text: String): Notification {
         val manager = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                NOTIFICATION_CHANNEL_ID, "VPN", NotificationManager.IMPORTANCE_LOW
-            )
-            manager.createNotificationChannel(channel)
+            manager.createNotificationChannel(NotificationChannel(NOTIFICATION_CHANNEL_ID, "VPN", NotificationManager.IMPORTANCE_LOW))
         }
-        val openApp = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE
-        )
+        val openApp = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("VpnClient")
-            .setContentText(text)
+            .setContentTitle("VpnClient").setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
-            .setContentIntent(openApp)
-            .setOngoing(true)
-            .build()
+            .setContentIntent(openApp).setOngoing(true).build()
     }
 
     private fun updateNotification(text: String) {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification(text))
+        getSystemService(NotificationManager::class.java).notify(NOTIFICATION_ID, buildNotification(text))
     }
 }
